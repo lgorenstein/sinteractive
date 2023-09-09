@@ -1,0 +1,243 @@
+#!/bin/bash
+# ----------------------------------------------------------------------
+# sinteractive - Request node(s) and launch an interactive job under Slurm.
+#
+# This started as a glorified wrapper to
+#      salloc [allocation options] [--x11] srun --pty --cpu-bind=none $SHELL -l
+# (which *was* a preferred Slurm way for interactive jobs, but is just
+# way too unwieldy to type every time).
+#
+# Starting in Slurm 20.11, job steps created by srun became exclusive, so
+# 'salloc ... srun --pty $SHELL' would grab all assigned resources and cause
+# consecutive srun's and mpirun's to hang.  The recommended way to start
+# interactive jobs in 20.11+ is to set 'LaunchParameters=use_interactive_step'
+# in slurm.conf, and then do plain
+# 	salloc [allocation options] [--x11]
+# (so that salloc would automatically launch a special interactive step
+# which would not cling to resources as a "normal" job step would).
+# See Slurm FAQ https://slurm.schedmd.com/faq.html#prompt for more details.
+#
+# This script abstracts all this complexity from the user.  It checks for
+# Slurm version and for 'use_interactive_step' presence, and adjusts the
+# underlying call accordingly.
+#
+# Usage:
+#      sinteractive [-h|--help|--wrapper-verbose|--no-x11]  [allocation options]
+#
+# Anything following the command is considered allocation options,
+# and will be passed to the underlying 'salloc' verbatim.
+#
+# X11 forwarding for the job (the '--x11' option to 'salloc') is automatically
+# enabled if current session has $DISPLAY environment variable set (unless
+# suppressed by an explicit '--no-x11' flag).
+
+# By Lev Gorenstein <lev@purdue.edu>, 2020
+# ----------------------------------------------------------------------
+
+VERSION="0.6.0" 			# Increment me!
+PROGNAME=${BASH_SOURCE##*/}
+
+
+# ----------------------------------------------------------------------
+# Default configuration and initialization.
+# ----------------------------------------------------------------------
+JOB_NAME_DEF="interactive"
+LOG_TAG="sinteractive"
+
+# Sane behavior in pipes
+set -o pipefail
+
+
+# ----------------------------------------------------------------------
+# Auxillary functions.
+# ----------------------------------------------------------------------
+function tostderr() {
+    echo -e "$@" 1>&2
+}
+
+function warn() {
+    tostderr "$PROGNAME:" "$@"
+}
+
+function usage() {
+    echo "Usage:"
+    echo -e "   $PROGNAME [-h|--help|--wrapper-verbose|--no-x11]  [allocation option]"
+}
+
+
+function help_message() {
+    # Yes, I don't like the '<<-' form, so indentation is somewhat off
+    cat << _EOF_
+$PROGNAME ver. $VERSION
+
+Request node(s) and launch an interactive job under Slurm.
+
+Essentially this program is a glorified wrapper for:
+     salloc [allocation options] [--x11] srun --pty --cpu-bind=none \$SHELL -l
+or
+     salloc [allocation options] [--x11]
+(both of which are preferred ways to launch interactive jobs depending on
+your version of Slurm and some other conditions - but who's got time to
+remember all the details or type all that mouthful?)
+
+This command abstracts the complexity as a logical counterpart to 'sbatch'.
+
+$(usage)
+
+Options:
+   -h, --help		 Display this help message and exit.
+   --wrapper-verbose 	 Add a bit of verbosity (show what's being executed).
+   --no-x11		 Disable automatic X11 forwarding.
+
+Anything else on the command line is considered allocation options, and
+will be passed to the underlying 'salloc' verbatim.  This way you can
+request account/nodes/cores/walltime and other resources your job requires.
+See 'man salloc' or 'salloc -h' for detailed help on options.
+
+X11 forwarding for the job (the '--x11' option to salloc) is automatically
+enabled if current session has \$DISPLAY environment variable set (unless
+suppressed by an explicit '--no-x11' flag).
+
+Example:
+   user@cluster-fe00 ~ $  $PROGNAME -N 2 -n 40 -t 24:00:00 -A myaccount
+   salloc: Pending job allocation 12345
+   salloc: job 12345 queued and waiting for resources
+      ......[ some time may pass here ]......
+   salloc: Nodes cluster-a[000-001] are ready for job
+   user@cluster-a000 ~ $                               <-- On the node now
+_EOF_
+    echo ""
+}
+
+
+function warn_mpi_will_hang() {
+    # Yes, I don't like the '<<-' form, so indentation is somewhat off
+    tostderr ""
+    cat 1>&2 << _EOF_
+========================================================================
+This Slurm installation v.$slurm_ver is affected by default behavior change
+introduced in version 20.11 (see https://slurm.schedmd.com/faq.html#prompt).
+
+$PROGNAME will start an interactive job now.  Serial or multi-threaded
+processes inside this job will run as expected, but any calls to 'srun'
+or 'mpirun' will hang (see above link for explanations).
+
+If you need an interactive parallel capability, please contact your site
+support team and ask them to consider enabling
+	LaunchParameters=use_interactive_step
+in Slurm configuration.
+========================================================================
+_EOF_
+    tostderr ""
+}
+
+function get_user_shell() {
+    # Choice of shell to start: user's login shell.
+    # Note: this only matters for the old "salloc ... srun $SHELL" method.
+    SHELL_BIN=${SHELL:-$(getent passwd $LOGNAME | cut -d: -f7)}
+    SHELL_DEF="/bin/bash" 		# Fallback if can't find login shell
+    SHELL_OPTS=( -l ) 			# Ensure it's a login shell
+    if [[ -z "$SHELL_BIN" ]]; then
+        warn "Can not determine user login shell, falling back to $SHELL_DEF"
+        SHELL_BIN="$SHELL_DEF"
+    fi
+    if [[ ! -x "$SHELL_BIN" ]]; then
+        warn "Detected shell '$SHELL_BIN' is not executable, bailing out."
+        exit 1
+    fi
+}
+
+
+
+# ----------------------------------------------------------------------
+# Log the invocation
+# ----------------------------------------------------------------------
+/bin/logger -t "$LOG_TAG" -- "user=$USER cmdline=$*"
+
+
+# ----------------------------------------------------------------------
+# Parse command-line
+# ----------------------------------------------------------------------
+verbo=0
+declare -a SALLOC_EXTRA SRUN_EXTRA
+passx11=1
+while [[ -n $1 ]]; do
+    case $1 in
+        --no-x11)
+            passx11=0 ;;
+        --wrapper-verbose)
+            verbo=1 ;;
+        -h | --help)
+            help_message
+            exit 0
+            ;;
+        *)
+            SALLOC_EXTRA+=( "$1" ) ;; 	# Accumulate arguments
+    esac
+    shift
+done
+
+
+# ----------------------------------------------------------------------
+# Defaults and sanity checks
+# ----------------------------------------------------------------------
+# Options for salloc.
+# Defaults, then everything collected (so it can override defaults)
+SALLOC_OPTS=( -J "$JOB_NAME_DEF" --bell )
+
+# Ensure X11 forwarding when available.
+# Note: passing it to the salloc stage, not to the underlying srun.
+if [[ -n "$DISPLAY" && "$passx11" -ne 0 ]]; then
+    SALLOC_OPTS+=( --x11 )
+fi
+
+# And append user-supplied options
+SALLOC_OPTS+=( "${SALLOC_EXTRA[@]}" )
+
+# Options for srun.
+# Defaults, then everything collected (so it can override defaults)
+SRUN_OPTS=( --pty ) 			# need pty allocation!
+SRUN_OPTS+=( --cpu-bind=none ) 		# all CPUs are to be available
+SRUN_OPTS+=( "${SRUN_EXTRA[@]}" )
+
+# Where binaries are
+SALLOC_BIN=/usr/bin/salloc
+SRUN_BIN=/usr/bin/srun
+SCONTROL_BIN=/usr/bin/scontrol
+
+# Does this Slurm have 'use_interactive_step' enabled?
+use_interactive_step=0
+if $SCONTROL_BIN show config |& grep 'LaunchParameters.*use_interactive_step' >& /dev/null; then
+    use_interactive_step=1
+fi
+
+# What is this Slurm's version?
+read junk slurm_ver < <($SRUN_BIN --version)
+read slurm_maj slurm_min < <(echo "$slurm_ver" | awk -F. '{print $1+0, $2+0}')
+
+
+# ----------------------------------------------------------------------
+# OK, spawn!
+# ----------------------------------------------------------------------
+# Adjust behavior based on Slurm settings and version.
+if [[ "$use_interactive_step" -ne 0 ]]; then
+   # Hooray, salloc will automagically start the shell on the node for us!
+   if [[ $verbo -gt 0 ]]; then
+       warn "$SALLOC_BIN ${SALLOC_OPTS[*]}"
+   fi
+   exec $SALLOC_BIN "${SALLOC_OPTS[@]}"
+
+else
+   # Fall back to the old 'salloc ... srun --pty $SHELL' way.
+   get_user_shell
+   if [[ $verbo -gt 0 ]]; then
+       warn "$SALLOC_BIN ${SALLOC_OPTS[*]} $SRUN_BIN ${SRUN_OPTS[*]} $SHELL_BIN ${SHELL_OPTS[*]}"
+   fi
+
+   # Warn the user if their Slurm's new defaults could cause issues.
+   if [[ "$slurm_maj" -ge 21 || "$slurm_ver" == 20.1[12]* ]]; then
+	warn_mpi_will_hang
+   fi
+   exec $SALLOC_BIN "${SALLOC_OPTS[@]}" $SRUN_BIN "${SRUN_OPTS[@]}" "$SHELL_BIN" "${SHELL_OPTS[@]}"
+fi
+
