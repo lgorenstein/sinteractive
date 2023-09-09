@@ -31,6 +31,7 @@ underlying command.
 
 ## Author:
 
-Lev Gorenstein, Rosen Center for Advanced Computing, Purdue University, 2020.
+Lev Gorenstein, Rosen Center for Advanced Computing, Purdue University, 2020-2023.
+Please note that as of September 2023 I am no longer affiliated with Purdue University.
 
 Contribute: https://github.com/lgorenstein/sinteractive
